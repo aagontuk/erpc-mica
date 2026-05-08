@@ -43,11 +43,11 @@ DpdkTransport::DpdkTransport(uint16_t sm_udp_port, uint8_t rpc_id,
 
       // clang-format off
       const char *rte_argv[] = {
-          "-c",            "0x0",
+          "-l",            "0",    // Main lcore = 0; affinity cleared below
           "-n",            "6",  // Memory channels
           "-m",            "1024", // Max memory in megabytes
           "--proc-type",   "auto",
-          "--log-level",   (ERPC_LOG_LEVEL >= ERPC_LOG_LEVEL_INFO) ? "8" : "0",
+          "--log-level",   (ERPC_LOG_LEVEL >= ERPC_LOG_LEVEL_INFO) ? "8" : "4",
           nullptr};
       // clang-format on
 
@@ -175,7 +175,8 @@ void DpdkTransport::resolve_phy_port() {
 
   // Resolve RSS indirection table size
   struct rte_eth_dev_info dev_info;
-  rte_eth_dev_info_get(phy_port_, &dev_info);
+  rt_assert(rte_eth_dev_info_get(phy_port_, &dev_info) == 0,
+            "rte_eth_dev_info_get failed");
 
   const std::string drv_name = dev_info.driver_name;
   rt_assert(drv_name == "net_mlx4" or drv_name == "net_mlx5" or
@@ -197,14 +198,15 @@ void DpdkTransport::resolve_phy_port() {
   // in secondary DPDK processes (up to DPDK 21.05).
   struct rte_eth_link link;
   if (dpdk_proc_type_ == DpdkProcType::kPrimary) {
-    rte_eth_link_get(static_cast<uint8_t>(phy_port_), &link);
-    rt_assert(link.link_status == ETH_LINK_UP,
+    rt_assert(rte_eth_link_get(static_cast<uint8_t>(phy_port_), &link) == 0,
+              "rte_eth_link_get failed");
+    rt_assert(link.link_status == RTE_ETH_LINK_UP,
               "Port " + std::to_string(phy_port_) + " is down.");
   } else {
     link = g_memzone->link_[phy_port_];
   }
 
-  if (link.link_speed != ETH_SPEED_NUM_NONE) {
+  if (link.link_speed != RTE_ETH_SPEED_NUM_NONE) {
     // link_speed is in Mbps. The 10 Gbps check below is just a sanity check.
     rt_assert(link.link_speed >= 10000, "Link too slow");
     resolve_.bandwidth_ =

@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
       "-n",          "6",  // Memory channels
       "-m",          "1024", // Max memory in megabytes
       "--proc-type", "primary",
-      "--log-level", (ERPC_LOG_LEVEL >= ERPC_LOG_LEVEL_INFO) ? "8" : "0",
+      "--log-level", (ERPC_LOG_LEVEL >= ERPC_LOG_LEVEL_INFO) ? "8" : "4",
       nullptr};
   // clang-format on
 
@@ -70,8 +70,9 @@ int main(int argc, char **argv) {
 
   // Check if the link is up
   struct rte_eth_link link;
-  rte_eth_link_get(static_cast<uint8_t>(FLAGS_phy_port), &link);
-  if (link.link_status != ETH_LINK_UP) {
+  erpc::rt_assert(rte_eth_link_get(static_cast<uint8_t>(FLAGS_phy_port), &link) == 0,
+            "rte_eth_link_get failed");
+  if (link.link_status != RTE_ETH_LINK_UP) {
     fprintf(stderr, "eRPC DPDK daemon: Error: Port %zu link is down\n",
             FLAGS_phy_port);
     exit(-1);
