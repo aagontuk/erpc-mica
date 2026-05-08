@@ -14,7 +14,7 @@ static_assert(is_power_of_two(kSessionCredits), "");
 /// Request window size. This must be a power of two for fast multiplication and
 /// modulo calculation during request number assignment and slot number
 /// decoding, respectively.
-static constexpr size_t kSessionReqWindow = 8;
+static constexpr size_t kSessionReqWindow = 32;
 static_assert(is_power_of_two(kSessionReqWindow), "");
 
 // Invalid metadata values for session endpoint initialization

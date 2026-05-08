@@ -16,11 +16,12 @@
 
 DEFINE_uint64(num_server_threads, 1,    "Server threads");
 DEFINE_uint64(num_client_threads, 1,    "Client threads per process");
-DEFINE_uint64(num_keys,        1000000, "Keys pre-loaded in table");
+DEFINE_uint64(num_keys,        1048576, "Keys pre-loaded in table; must be a power of 2");
 DEFINE_uint64(target_pps,      1000000, "Total target send rate (pps); 0 = unlimited");
 DEFINE_uint64(warmup_ms,          2000, "Warmup duration in ms (stats ignored)");
 DEFINE_string(workload,            "B", "YCSB workload: A (50/50) B (95/5) C (100/0)");
 DEFINE_double(zipf_theta,         0.99, "Zipf skew; 0 = uniform");
+DEFINE_uint64(batch_send,            1, "Requests to enqueue per event-loop turn");
 
 // ---- Globals ----
 
@@ -110,6 +111,7 @@ public:
 
     // Batch state
     size_t           batch_sz = 0;
+    uint64_t         batch_first_tsc = 0;  // TSC when first request of current batch arrived
     erpc::ReqHandle *req_handle_arr[kMaxBatch];
     bool             is_set_arr[kMaxBatch];
     MicaKey          key_arr[kMaxBatch];
@@ -161,6 +163,7 @@ static void ht_get_handler(erpc::ReqHandle *req_handle, void *_ctx) {
     uint64_t kh = mica::util::hash(&mk, sizeof(MicaKey));
 
     const size_t bi       = c->batch_sz;
+    if (bi == 0) c->batch_first_tsc = erpc::rdtsc();
     c->req_handle_arr[bi] = req_handle;
     c->is_set_arr[bi]     = false;
     c->key_arr[bi]        = mk;
@@ -194,6 +197,7 @@ static void ht_set_handler(erpc::ReqHandle *req_handle, void *_ctx) {
     uint64_t kh = mica::util::hash(&mk, sizeof(MicaKey));
 
     const size_t bi       = c->batch_sz;
+    if (bi == 0) c->batch_first_tsc = erpc::rdtsc();
     c->req_handle_arr[bi] = req_handle;
     c->is_set_arr[bi]     = true;
     c->key_arr[bi]        = mk;
@@ -237,10 +241,15 @@ static void server_func(erpc::Nexus *nexus, size_t tid) {
                                     ports.at(0));
     c.rpc_ = &rpc;
 
+    const double freq_ghz = rpc.get_freq_ghz();
+    const uint64_t kBatchMaxCycles =
+        static_cast<uint64_t>(5.0 * freq_ghz * 1000.0);  // 5 µs
+
     while (!ctrl_c_pressed) {
-        const size_t before = c.batch_sz;
         rpc.run_event_loop_once();
-        if (c.batch_sz == before && c.batch_sz > 0) drain_batch(&c);
+        if (c.batch_sz > 0 &&
+            erpc::rdtsc() - c.batch_first_tsc >= kBatchMaxCycles)
+            drain_batch(&c);
     }
 
     printf("Server thread %zu: gets_ok=%zu miss=%zu | "
@@ -385,7 +394,7 @@ void kv_cont_func(void *_ctx, void *_tag) {
     }
 
     uint64_t now = erpc::rdtsc();
-    if (now >= c->warmup_end_tsc) {
+    if (c->measure_start_tsc > 0 && now >= c->measure_start_tsc) {
         c->stats.rx_measured++;
         if (c->rtt_count < ClientContext::kMaxSamples)
             c->rtt_samples[c->rtt_count++] = now - slot.orig_send_tsc;
@@ -500,8 +509,8 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
     c.ycsb_workload = workload_from_flag();
     c.target_pps    = FLAGS_target_pps / FLAGS_num_client_threads;
 
-    if (c.use_zipf && tid == 0)
-        zipf_init(&g_zipf, FLAGS_num_keys, FLAGS_zipf_theta);
+    erpc::rt_assert((FLAGS_num_keys & (FLAGS_num_keys - 1)) == 0,
+                    "--num_keys must be a power of 2 for uniform key distribution");
 
     c.rtt_samples = new uint64_t[ClientContext::kMaxSamples];
 
@@ -545,11 +554,12 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
             c.measure_start_tsc = now;
         }
 
-        if ((c.packet_delay_cycle == 0 || now >= c.deadline)
-                && c.in_flight < kMaxPending) {
-            kv_send_req(c);
-            c.deadline += c.packet_delay_cycle;
-            if (measuring) c.stats.tx_measured++;
+        if (c.packet_delay_cycle == 0 || now >= c.deadline) {
+            for (uint64_t b = 0; b < FLAGS_batch_send && c.in_flight < kMaxPending; b++) {
+                kv_send_req(c);
+                if (measuring) c.stats.tx_measured++;
+            }
+            c.deadline += c.packet_delay_cycle * FLAGS_batch_send;
         }
 
         rpc.run_event_loop_once();
@@ -606,6 +616,9 @@ int main(int argc, char **argv) {
 
     size_t nthreads = (FLAGS_process_id == 0) ? FLAGS_num_server_threads
                                               : FLAGS_num_client_threads;
+
+    if (FLAGS_process_id != 0 && FLAGS_zipf_theta > 0.0)
+        zipf_init(&g_zipf, FLAGS_num_keys, FLAGS_zipf_theta);
 
     std::vector<std::thread> threads(nthreads);
     for (size_t i = 0; i < nthreads; i++) {

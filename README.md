@@ -191,13 +191,13 @@ Both the server and client must be launched from the repo root directory.
 **Server (process 0, node-0):**
 
 ```bash
-sudo ./build/mica_server --process_id 0 --num_processes 2 --num_server_threads 1 --num_keys 1000000 --numa_node 1 --numa_1_ports 3
+sudo ./build/mica_server --process_id 0 --num_processes 2 --num_server_threads 1 --num_keys 1048576 --numa_node 1 --numa_1_ports 3
 ```
 
 **Client (process 1, node-1):**
 
 ```bash
-sudo ./build/mica_server --process_id 1 --num_processes 2 --num_server_threads 1 --num_client_threads 4 --num_keys 1000000 --target_pps 5000000 --test_ms 5000 --warmup_ms 2000 --workload B --zipf_theta 0.99 --numa_node 1 --numa_1_ports 3
+sudo ./build/mica_server --process_id 1 --num_processes 2 --num_server_threads 1 --num_client_threads 4 --num_keys 1048576 --target_pps 5000000 --test_ms 5000 --warmup_ms 2000 --workload B --zipf_theta 0.99 --numa_node 1 --numa_1_ports 3
 ```
 
 ### Options
@@ -210,8 +210,9 @@ All flags from `apps/apps_common.h` are also available.
 | `--num_processes` | — | Total number of eRPC processes (server + clients). |
 | `--num_server_threads` | `1` | Server RPC threads. Each thread owns a separate MICA table partition. |
 | `--num_client_threads` | `1` | Client threads per process. |
-| `--num_keys` | `1000000` | Keys pre-loaded into the table at startup. Keys are `1..num_keys`; initial value is `key + 1`. |
+| `--num_keys` | `1048576` | Keys pre-loaded into the table at startup. Must be a power of 2. Keys are `1..num_keys`; initial value is `key + 1`. |
 | `--target_pps` | `1000000` | Total client send rate in requests/sec, split evenly across threads. `0` = unlimited (max throughput mode). |
+| `--batch_send` | `1` | Requests enqueued per `run_event_loop_once()` call. Set to 3 for paper-level client throughput (§6.2). |
 | `--test_ms` | `0` | Test duration in milliseconds. `0` = run until Ctrl-C. |
 | `--warmup_ms` | `2000` | Warmup duration; RTT samples collected during this period are discarded. |
 | `--workload` | `B` | YCSB workload mix: `A` = 50% GET / 50% SET, `B` = 95% GET / 5% SET, `C` = 100% GET. |
