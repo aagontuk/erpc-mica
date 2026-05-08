@@ -147,6 +147,94 @@ make latency
    applications, statistics generated in a run can be collected and processed
    using `scripts/proc-out.sh`.
 
+## MICA key-value server (`mica_server`)
+
+`apps/mica_server/` implements a MICA-backed key-value server and an
+open-loop benchmark client.  The server stores `uint64_t` key/value pairs in a
+`mica::table::FixedTable` and exposes two eRPC request types: **HT_GET** and
+**HT_SET**.  Both roles (server and client) are compiled into the same binary
+and selected at runtime via `--process_id`.
+
+### Build
+
+```bash
+mkdir -p build_mica && cd build_mica
+cmake .. -DPERF=ON -DTRANSPORT=dpdk -DAPP=mica_server
+make -j$(nproc)
+```
+
+The binary is written to `build/mica_server`.
+
+### One-time setup
+
+`get_uri_for_process()` reads `../eRPC/scripts/autorun_process_file` relative
+to the working directory.  Create a symlink so this path resolves correctly
+when the binary is run from the repo root:
+
+```bash
+ln -sfn /path/to/erpc-mica /path/to/eRPC
+```
+
+Edit `scripts/autorun_process_file` to list the hostname and management UDP
+port for each process (one line per process, format: `<hostname> <port> <numa_node>`):
+
+```
+node-0 31850 0
+node-1 31850 0
+```
+
+### Running
+
+Both the server and client must be launched from the repo root directory.
+`--process_id 0` is always the server.  Every additional process ID is a client.
+
+**Server (process 0, node-0):**
+
+```bash
+sudo ./build/mica_server --process_id 0 --num_processes 2 --num_server_threads 1 --num_keys 1000000 --numa_node 1 --numa_1_ports 3
+```
+
+**Client (process 1, node-1):**
+
+```bash
+sudo ./build/mica_server --process_id 1 --num_processes 2 --num_server_threads 1 --num_client_threads 4 --num_keys 1000000 --target_pps 5000000 --test_ms 5000 --warmup_ms 2000 --workload B --zipf_theta 0.99 --numa_node 1 --numa_1_ports 3
+```
+
+### Options
+
+All flags from `apps/apps_common.h` are also available.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--process_id` | — | Global process index. `0` = server, `≥1` = client. |
+| `--num_processes` | — | Total number of eRPC processes (server + clients). |
+| `--num_server_threads` | `1` | Server RPC threads. Each thread owns a separate MICA table partition. |
+| `--num_client_threads` | `1` | Client threads per process. |
+| `--num_keys` | `1000000` | Keys pre-loaded into the table at startup. Keys are `1..num_keys`; initial value is `key + 1`. |
+| `--target_pps` | `1000000` | Total client send rate in requests/sec, split evenly across threads. `0` = unlimited (max throughput mode). |
+| `--test_ms` | `0` | Test duration in milliseconds. `0` = run until Ctrl-C. |
+| `--warmup_ms` | `2000` | Warmup duration; RTT samples collected during this period are discarded. |
+| `--workload` | `B` | YCSB workload mix: `A` = 50% GET / 50% SET, `B` = 95% GET / 5% SET, `C` = 100% GET. |
+| `--zipf_theta` | `0.99` | Zipf skew for key selection. `0` = uniform random. |
+| `--numa_node` | `0` | NUMA node to use for memory allocation and NIC selection. |
+| `--numa_0_ports` | `""` | Comma-separated DPDK port IDs on NUMA node 0. |
+| `--numa_1_ports` | `""` | Comma-separated DPDK port IDs on NUMA node 1. |
+
+### Client output
+
+After the test completes each thread prints a latency and throughput summary:
+
+```
+Thread 0: sent=2603775 rx=2602726 unresolved=1019
+Thread 0: mean=1916.80 us  p50=1913.32 us  p99=2033.52 us
+Thread 0: GET ok=2472495 miss=0 | SET ok=130231 fail=0 dedup=0
+```
+
+`unresolved` counts requests that were in-flight when the deadline loop
+exited; they are bounded by the per-thread pending table size (1024).
+
+---
+
 ## Getting help
  * GitHub issues are preferred over email. Please include the following
    information in the issue:

@@ -213,6 +213,11 @@ set(MICA_SOURCES
   mica/src/mica/util/cityhash/city_mod.cc
   mica/src/mica/util/config.cc)
 
+# Suppress warnings from vendored RapidJSON (deprecated copy constructors and
+# class-memaccess patterns that are harmless but trip -Werror on GCC >= 9)
+set_source_files_properties(mica/src/mica/util/config.cc PROPERTIES
+  COMPILE_FLAGS "-Wno-deprecated-copy -Wno-class-memaccess")
+
 # The app to compile. Only one app is compiled to reduce compile time.
 if(EXISTS "${CMAKE_SOURCE_DIR}/scripts/autorun_app_file")
   file(STRINGS "scripts/autorun_app_file" APP)
@@ -263,6 +268,9 @@ elseif(APP STREQUAL "pmem_bw")
   message(STATUS "DPDK is needed for pmem_bw application")
   add_definitions(-fpermissive)
   set(DPDK_NEEDED "true")
+elseif(APP STREQUAL "mica_server")
+  include_directories(mica/src)
+  set(APP_ADDITIONAL_SOURCES ${MICA_SOURCES})
 elseif(APP STREQUAL "persistent_kv")
   set(LIBRARIES ${LIBRARIES} ${PMEM} cityhash)
 elseif(APP STREQUAL "log")

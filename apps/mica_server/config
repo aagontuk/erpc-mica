@@ -1,0 +1,11 @@
+--num_processes 2
+--num_server_threads 1
+--num_client_threads 4
+--num_keys 1000000
+--target_pps 5000000
+--test_ms 5000
+--warmup_ms 2000
+--workload B
+--zipf_theta 0.99
+--numa_node 1
+--numa_1_ports 3
