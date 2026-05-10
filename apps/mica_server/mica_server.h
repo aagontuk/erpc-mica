@@ -10,7 +10,6 @@ struct ht_rpc_req_t {
     uint8_t  cmd;    // 0=GET, 1=SET
     uint64_t key;
     uint64_t value;  // only meaningful for SET
-    uint64_t nseq;   // client sequence number for dedup
 } __attribute__((packed));
 
 struct ht_rpc_resp_t {
@@ -30,7 +29,6 @@ enum HtStatus : uint8_t {
     HT_SUCCESS           = 0,
     HT_ERR_KEY_NOT_FOUND = 1,
     HT_ERR_FULL          = 2,
-    HT_ERR_DUPLICATE     = 3,
 };
 
 // ---- MICA table configuration ----

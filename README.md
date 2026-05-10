@@ -149,11 +149,15 @@ make latency
 
 ## MICA key-value server (`mica_server`)
 
-`apps/mica_server/` implements a MICA-backed key-value server and an
-open-loop benchmark client.  The server stores `uint64_t` key/value pairs in a
+`apps/mica_server/` implements a MICA-backed key-value server and a
+closed-loop benchmark client.  The server stores `uint64_t` key/value pairs in a
 `mica::table::FixedTable` and exposes two eRPC request types: **HT_GET** and
 **HT_SET**.  Both roles (server and client) are compiled into the same binary
 and selected at runtime via `--process_id`.
+
+The client runs at maximum rate: each thread keeps 1024 requests in flight
+at all times, reissuing each slot immediately upon response.  Throughput and
+latency (p50/p99 via `erpc::Latency`) are reported every second.
 
 ### Build
 
@@ -197,7 +201,7 @@ sudo ./build/mica_server --process_id 0 --num_processes 2 --num_server_threads 1
 **Client (process 1, node-1):**
 
 ```bash
-sudo ./build/mica_server --process_id 1 --num_processes 2 --num_server_threads 1 --num_client_threads 4 --num_keys 1048576 --target_pps 5000000 --test_ms 5000 --warmup_ms 2000 --workload B --zipf_theta 0.99 --numa_node 1 --numa_1_ports 3
+sudo ./build/mica_server --process_id 1 --num_processes 2 --num_server_threads 1 --num_client_threads 4 --num_keys 1048576 --test_ms 5000 --workload B --zipf_theta 0.99 --numa_node 1 --numa_1_ports 3
 ```
 
 ### Options
@@ -211,10 +215,7 @@ All flags from `apps/apps_common.h` are also available.
 | `--num_server_threads` | `1` | Server RPC threads. Each thread owns a separate MICA table partition. |
 | `--num_client_threads` | `1` | Client threads per process. |
 | `--num_keys` | `1048576` | Keys pre-loaded into the table at startup. Must be a power of 2. Keys are `1..num_keys`; initial value is `key + 1`. |
-| `--target_pps` | `1000000` | Total client send rate in requests/sec, split evenly across threads. `0` = unlimited (max throughput mode). |
-| `--batch_send` | `1` | Requests enqueued per `run_event_loop_once()` call. Set to 3 for paper-level client throughput (§6.2). |
 | `--test_ms` | `0` | Test duration in milliseconds. `0` = run until Ctrl-C. |
-| `--warmup_ms` | `2000` | Warmup duration; RTT samples collected during this period are discarded. |
 | `--workload` | `B` | YCSB workload mix: `A` = 50% GET / 50% SET, `B` = 95% GET / 5% SET, `C` = 100% GET. |
 | `--zipf_theta` | `0.99` | Zipf skew for key selection. `0` = uniform random. |
 | `--numa_node` | `0` | NUMA node to use for memory allocation and NIC selection. |
@@ -223,16 +224,15 @@ All flags from `apps/apps_common.h` are also available.
 
 ### Client output
 
-After the test completes each thread prints a latency and throughput summary:
+Each thread prints one stats line per second showing throughput, retransmission
+count, operation breakdown, and latency percentiles:
 
 ```
-Thread 0: sent=2603775 rx=2602726 unresolved=1019
-Thread 0: mean=1916.80 us  p50=1913.32 us  p99=2033.52 us
-Thread 0: GET ok=2472495 miss=0 | SET ok=130231 fail=0 dedup=0
+Thread 0: 1.093 Mrps, re_tx=0. GET ok=1038643 miss=0 | SET ok=54558 fail=0. Lat: p50=933.33 us p99=986.67 us
 ```
 
-`unresolved` counts requests that were in-flight when the deadline loop
-exited; they are bounded by the per-thread pending table size (1024).
+The first second is typically lower while eRPC sessions establish; steady-state
+begins from the second line onward.
 
 ---
 
