@@ -142,6 +142,7 @@ DpdkTransport::DpdkTransport(uint16_t sm_udp_port, uint8_t rpc_id,
   }
 
   resolve_phy_port();
+  install_flow_rule(phy_port_, qp_id_, resolve_.ipv4_addr_, rx_flow_udp_port_);
   init_mem_reg_funcs();
 
   ERPC_WARN(

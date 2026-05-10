@@ -1,88 +1,74 @@
 /**
  * @file dpdk_flow_rules.cc
- * @brief Helpers for installing Flow Director rules in DPDK
+ * @brief rte_flow rules for steering UDP dst-port traffic to a specific RX queue.
  */
-#pragma once
 
 #ifdef ERPC_DPDK
 
-#include <rte_ethdev.h>
-#include "common.h"
+#include <rte_flow.h>
+#include "dpdk_transport.h"
 #include "util/logger.h"
 
 namespace erpc {
 
-#ifdef _WIN32
+void DpdkTransport::install_flow_rule(size_t phy_port, size_t qp_id,
+                                      uint32_t ipv4_addr, uint16_t udp_port) {
+  _unused(ipv4_addr);  // Match on UDP dst port only; IP is wildcarded
 
-static void install_flow_rule(size_t phy_port, size_t qp_id, uint32_t ipv4_addr,
-                              uint16_t udp_port) {
-  rt_assert(false, "Not implemented for Windows\n");
-}
+  struct rte_flow_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.ingress = 1;
+  attr.priority = 1;
 
-#else   // _WIN32
+  struct rte_flow_item_udp udp_spec, udp_mask;
+  memset(&udp_spec, 0, sizeof(udp_spec));
+  memset(&udp_mask, 0, sizeof(udp_mask));
+  udp_spec.hdr.dst_port = rte_cpu_to_be_16(udp_port);
+  udp_mask.hdr.dst_port = UINT16_MAX;
 
-static void install_flow_rule(size_t phy_port, size_t qp_id, uint32_t ipv4_addr,
-                              uint16_t udp_port) {
-  bool installed = false;
+  struct rte_flow_item pattern[4];
+  memset(pattern, 0, sizeof(pattern));
+  pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+  pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
+  pattern[2].type = RTE_FLOW_ITEM_TYPE_UDP;
+  pattern[2].spec = &udp_spec;
+  pattern[2].mask = &udp_mask;
+  pattern[3].type = RTE_FLOW_ITEM_TYPE_END;
 
-  const int ntuple_filter_supported =
-      rte_eth_dev_filter_supported(phy_port, RTE_ETH_FILTER_NTUPLE);
+  struct rte_flow_action_queue queue_conf;
+  queue_conf.index = static_cast<uint16_t>(qp_id);
 
-  const int fdir_filter_supported =
-      rte_eth_dev_filter_supported(phy_port, RTE_ETH_FILTER_FDIR);
+  struct rte_flow_action actions[2];
+  memset(actions, 0, sizeof(actions));
+  actions[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+  actions[0].conf = &queue_conf;
+  actions[1].type = RTE_FLOW_ACTION_TYPE_END;
 
-  if (ntuple_filter_supported != 0 && fdir_filter_supported != 0) {
-    ERPC_WARN("No flow steering supported by NIC. Apps likely won't work.\n");
+  struct rte_flow_error error;
+  memset(&error, 0, sizeof(error));
+
+  int ret = rte_flow_validate(static_cast<uint16_t>(phy_port), &attr,
+                              pattern, actions, &error);
+  if (ret != 0) {
+    ERPC_WARN(
+        "rte_flow_validate failed for port %zu queue %zu UDP dst port %u: %s\n",
+        phy_port, qp_id, udp_port,
+        (error.message != nullptr) ? error.message : "unknown");
     return;
   }
 
-  // Try the simplest filter first. I couldn't get FILTER_FDIR to work with
-  // ixgbe, although it technically supports flow director.
-  if (ntuple_filter_supported == 0) {
-    struct rte_eth_ntuple_filter ntuple;
-    memset(&ntuple, 0, sizeof(ntuple));
-    ntuple.flags = RTE_5TUPLE_FLAGS;
-    ntuple.dst_port = rte_cpu_to_be_16(udp_port);
-    ntuple.dst_port_mask = UINT16_MAX;
-    ntuple.dst_ip = rte_cpu_to_be_32(ipv4_addr);
-    ntuple.dst_ip_mask = UINT32_MAX;
-    ntuple.proto = IPPROTO_UDP;
-    ntuple.proto_mask = UINT8_MAX;
-    ntuple.priority = 1;
-    ntuple.queue = qp_id;
-
-    int ret = rte_eth_dev_filter_ctrl(phy_port, RTE_ETH_FILTER_NTUPLE,
-                                      RTE_ETH_FILTER_ADD, &ntuple);
-    if (ret != 0) {
-      ERPC_WARN("Failed to add ntuple filter. This could be survivable.\n");
-    } else {
-      ERPC_WARN("Installed ntuple flow rule. Queue %zu, RX UDP port = %u.\n",
-                qp_id, udp_port);
-    }
-    installed = (ret == 0);
-  }
-
-  if (!installed && fdir_filter_supported == 0) {
-    // Use fdir filter for i40e (5-tuple not supported)
-    rte_eth_fdir_filter filter;
-    memset(&filter, 0, sizeof(filter));
-    filter.soft_id = qp_id;
-    filter.input.flow_type = RTE_ETH_FLOW_NONFRAG_IPV4_UDP;
-    filter.input.flow.udp4_flow.dst_port = rte_cpu_to_be_16(udp_port);
-    filter.input.flow.udp4_flow.ip.dst_ip = rte_cpu_to_be_32(ipv4_addr);
-    filter.action.rx_queue = qp_id;
-    filter.action.behavior = RTE_ETH_FDIR_ACCEPT;
-    filter.action.report_status = RTE_ETH_FDIR_NO_REPORT_STATUS;
-
-    int ret = rte_eth_dev_filter_ctrl(phy_port, RTE_ETH_FILTER_FDIR,
-                                      RTE_ETH_FILTER_ADD, &filter);
-    rt_assert(ret == 0, "Failed to add fdir flow rule: ", strerror(-1 * ret));
-
-    ERPC_WARN("Installed flow-director rule. Queue %zu, RX UDP port = %u.\n",
-              qp_id, udp_port);
+  struct rte_flow *flow = rte_flow_create(static_cast<uint16_t>(phy_port),
+                                          &attr, pattern, actions, &error);
+  if (flow == nullptr) {
+    ERPC_WARN(
+        "rte_flow_create failed for port %zu queue %zu UDP dst port %u: %s\n",
+        phy_port, qp_id, udp_port,
+        (error.message != nullptr) ? error.message : "unknown");
+  } else {
+    ERPC_WARN("Installed rte_flow rule: port %zu, queue %zu, UDP dst port %u\n",
+              phy_port, qp_id, udp_port);
   }
 }
-#endif  // _WIN32
 
 }  // namespace erpc
 #endif  // ERPC_DPDK
