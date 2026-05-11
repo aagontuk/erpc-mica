@@ -129,7 +129,8 @@ start_server() {
         if (( found >= needed )); then
             echo "  [${i}s]"; break
         fi
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        # Use sudo kill -0 so the check works when the server runs as root.
+        if ! sudo kill -0 "$SERVER_PID" 2>/dev/null; then
             echo ""; echo "Error: server exited unexpectedly:" >&2
             cat "$SERVER_LOG" >&2; exit 1
         fi
@@ -144,20 +145,61 @@ start_server() {
 }
 
 stop_server() {
-    [[ -n "$SERVER_PID" ]] && disown "$SERVER_PID" 2>/dev/null || true
-    [[ -n "$SERVER_PID" ]] && sudo kill -9 "$SERVER_PID" 2>/dev/null || true
+    if [[ -n "$SERVER_PID" ]]; then
+        disown "$SERVER_PID" 2>/dev/null || true
+        # Send SIGTERM first so DPDK/mlx5 can close the NIC cleanly.
+        sudo kill -TERM "$SERVER_PID" 2>/dev/null || true
+        for (( _ti=0; _ti<50; _ti++ )); do
+            sudo kill -0 "$SERVER_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        # Fall back to SIGKILL if still alive after 5 s.
+        sudo kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
     sudo pkill -9 mica_server 2>/dev/null || true
+    # Wait up to 10 s for processes to fully exit (SIGKILL delivery is async)
+    for (( _si=0; _si<100; _si++ )); do
+        sudo pgrep mica_server >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    sudo rm -rf /run/dpdk/rte/
     sudo rm -f /dev/hugepages/rtemap_*
+    # Wait for the Nexus SM UDP port (31850) to be released before returning,
+    # so the next start_server doesn't get "bind: Address already in use".
+    for (( _ui=0; _ui<60; _ui++ )); do
+        ss -uln 2>/dev/null | grep -qF ':31850 ' || break
+        sleep 0.5
+    done
+    # Wait up to 30 s for huge pages to return to the pool.  DPDK uses ~768 2MB
+    # pages per run (-m 1024 + HugeAlloc 512 MB); with only 3072 total, the 5th
+    # start starves if prior pages are not reclaimed before we proceed.
+    local _hp_total _hp_need
+    _hp_total=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 3072)
+    _hp_need=$(( _hp_total / 4 ))   # need at least 25% free for next run
+    for (( _hi=0; _hi<300; _hi++ )); do
+        local _hp_free
+        _hp_free=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages 2>/dev/null || echo "$_hp_total")
+        (( _hp_free >= _hp_need )) && break
+        sleep 0.1
+    done
     [[ -n "$SERVER_LOG" ]] && rm -f "$SERVER_LOG" || true
     SERVER_PID=""
     SERVER_LOG=""
 }
 
+# ---- Client-side DPDK cleanup (run between client invocations) ---------------
+cleanup_client() {
+    ssh "$CLIENT_NODE" \
+        "sudo pkill -9 mica_server 2>/dev/null; \
+         sudo rm -rf /run/dpdk/rte/ 2>/dev/null; \
+         sudo rm -f /dev/hugepages/rtemap_* 2>/dev/null; \
+         true" 2>/dev/null || true
+}
+
 # ---- Cleanup ----------------------------------------------------------------
 cleanup() {
     stop_server
-    ssh "$CLIENT_NODE" "sudo pkill -9 mica_server 2>/dev/null; true" 2>/dev/null || true
-    ssh "$CLIENT_NODE" "sudo rm -f /dev/hugepages/rtemap_* 2>/dev/null; true" 2>/dev/null || true
+    cleanup_client
 }
 trap cleanup EXIT INT TERM
 
@@ -225,8 +267,6 @@ if [[ "$GRID" == "1" ]]; then
         NUM_SERVER_THREADS_SAVED=$NUM_SERVER_THREADS
         NUM_SERVER_THREADS=$sthreads   # run_point reads this global
 
-        start_server "$sthreads"
-
         for ycsb_iter in a b c; do
             for skew_iter in zipf uniform; do
                 WORKLOAD="${ycsb_iter^^}"
@@ -237,7 +277,20 @@ if [[ "$GRID" == "1" ]]; then
                 PEAK_MRPS=0; PEAK_P50=0; PEAK_P99=0
                 AGG_MRPS=0; AVG_P50=0; AVG_P99=0
 
+                # Start the server once for this (sthreads, ycsb, skew) combo.
+                # The client properly disconnects sessions after each run, so
+                # the same server instance handles all client-thread counts.
+                # This avoids repeated DPDK NIC teardown/reinit which leaves
+                # stale state under forced kill.
+                start_server "$sthreads"
+
                 for (( t=1; t<=MAX_CLIENT_THREADS; t++ )); do
+                    # Clean up client-side DPDK state from the previous run
+                    # so the next client starts as a fresh DPDK primary.
+                    if (( t > 1 )); then
+                        cleanup_client
+                        sleep 1
+                    fi
                     if run_point "$t"; then
                         if awk "BEGIN{exit !($AGG_MRPS > $PEAK_MRPS)}"; then
                             PEAK_MRPS="$AGG_MRPS"
@@ -249,8 +302,9 @@ if [[ "$GRID" == "1" ]]; then
                     else
                         printf "    client_threads=%-3d  FAILED\n" "$t"
                     fi
-                    sleep 1
                 done
+
+                stop_server
 
                 echo "  → peak: ${PEAK_MRPS} Mrps  p50=${PEAK_P50} µs  p99=${PEAK_P99} µs"
                 echo "${sthreads},${ycsb_iter},${skew_iter},${PEAK_MRPS},${PEAK_P50},${PEAK_P99}" >> "$CSV_OUT"
@@ -258,8 +312,6 @@ if [[ "$GRID" == "1" ]]; then
         done
 
         NUM_SERVER_THREADS=$NUM_SERVER_THREADS_SAVED
-        stop_server
-        sleep 1
     done
 
     echo ""
@@ -272,7 +324,6 @@ fi
 # =============================================================================
 # SINGLE-CONFIG MODE (original behaviour)
 # =============================================================================
-start_server "$NUM_SERVER_THREADS"
 
 # ---- Print header -----------------------------------------------------------
 echo ""
@@ -289,10 +340,13 @@ PEAK_THREADS=0
 
 for (( t=1; t<=MAX_CLIENT_THREADS; t++ )); do
     AGG_MRPS=0; AVG_P50=0; AVG_P99=0
+    start_server "$NUM_SERVER_THREADS"
     if ! run_point "$t"; then
+        stop_server
         printf "│ %-15s │ %-10s │ %-10s │ %-10s │\n" "$t" "FAILED" "-" "-"
         continue
     fi
+    stop_server
 
     # Detect plateau: gain < 5% of previous point (skip check at t=1)
     FLAG=""
@@ -319,7 +373,6 @@ for (( t=1; t<=MAX_CLIENT_THREADS; t++ )); do
         break
     fi
 
-    # Brief pause between points so the server drains its queues
     sleep 1
 done
 
