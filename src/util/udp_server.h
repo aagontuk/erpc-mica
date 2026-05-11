@@ -16,8 +16,11 @@ class UDPServer {
  public:
   UDPServer(uint16_t port, size_t timeout_ms)
       : timeout_ms_(timeout_ms),
-        socket_(new asio::ip::udp::socket(
-            io_context_, asio::ip::udp::endpoint(asio::ip::udp::v4(), port))) {}
+        socket_(new asio::ip::udp::socket(io_context_)) {
+    socket_->open(asio::ip::udp::v4());
+    socket_->set_option(asio::socket_base::reuse_address(true));
+    socket_->bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
+  }
 
   UDPServer() {}
   UDPServer(const UDPServer &) = delete;

@@ -165,6 +165,15 @@ DpdkTransport::~DpdkTransport() {
 
   int ret = g_memzone->free_qp(phy_port_, qp_id_);
   rt_assert(ret == 0, "Failed to free QP\n");
+
+  // When the last transport on this process releases its QP, stop and close
+  // the NIC port so the mlx5 driver fully releases queue and flow-rule state
+  // before the next DPDK process re-initializes the port.
+  if (dpdk_proc_type_ == DpdkProcType::kPrimary &&
+      g_memzone->get_num_qps_available() == kMaxQueuesPerPort) {
+    rte_eth_dev_stop(static_cast<uint16_t>(phy_port_));
+    rte_eth_dev_close(static_cast<uint16_t>(phy_port_));
+  }
 }
 
 void DpdkTransport::resolve_phy_port() {
