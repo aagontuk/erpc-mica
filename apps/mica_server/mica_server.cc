@@ -243,6 +243,7 @@ public:
     bool     use_zipf;
     uint64_t key_mask;
     uint64_t rng_state;
+    bool     draining = false;  // set true to stop reissuing and let slots drain
 
     erpc::Latency    latency;
     erpc::ChronoTimer tput_timer;
@@ -324,7 +325,8 @@ void kv_cont_func(void *_ctx, void *_tag) {
 
     c->stats.rx_tot++;
 
-    kv_send_req(*c, slot_idx);  // reissue immediately — same pattern as small_rpc_tput
+    if (!c->draining)
+        kv_send_req(*c, slot_idx);  // reissue immediately — same pattern as small_rpc_tput
 }
 
 static void create_sessions(ClientContext &c) {
@@ -396,6 +398,16 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
         if (ctrl_c_pressed == 1) break;
         print_stats(c);
     }
+
+    // Stop reissuing and drain all in-flight RPCs so sessions become idle.
+    c.draining = true;
+    rpc.run_event_loop(kEvLoopMs * 2);
+
+    // Disconnect every session so the server reclaims its ring entries.
+    for (int sn : c.session_num_vec_) rpc.destroy_session(sn);
+    const size_t expected_sm_resps = 2 * FLAGS_num_server_threads;  // connect + disconnect
+    for (size_t ms = 0; ms < 5000 && c.num_sm_resps_ < expected_sm_resps; ms += kEvLoopMs)
+        rpc.run_event_loop(kEvLoopMs);
 }
 
 // ============================================================
@@ -403,7 +415,8 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
 // ============================================================
 
 int main(int argc, char **argv) {
-    signal(SIGINT, ctrl_c_handler);
+    signal(SIGINT,  ctrl_c_handler);
+    signal(SIGTERM, ctrl_c_handler);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     fprintf(stderr, "[debug] flags parsed, process_id=%zu\n", FLAGS_process_id);
 
