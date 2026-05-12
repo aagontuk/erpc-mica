@@ -171,16 +171,18 @@ static void ht_set_handler(erpc::ReqHandle *req_handle, void *_ctx) {
 
 static void populate_table(ServerContext &c) {
     const size_t N = static_cast<size_t>(FLAGS_num_keys);
-    for (size_t i = 1; i <= N; i++) {
+    size_t i;
+    for (i = 1; i <= N; i++) {
         MicaKey  mk = make_key(i);
         uint64_t kh = mica::util::hash(&mk, sizeof(MicaKey));
         uint64_t v  = i + 1;
         MicaResult res = c.table->set(kh, mk, reinterpret_cast<const char *>(&v));
         if (res != MicaResult::kSuccess) {
-            printf("thread %zu: populate stopped at key %zu\n", c.thread_id, i);
+            printf("thread %zu: populate stopped at key %zu (table full)\n", c.thread_id, i);
             break;
         }
     }
+    printf("thread %zu: populated %zu / %zu keys\n", c.thread_id, i - 1, N);
 }
 
 static void server_func(erpc::Nexus *nexus, size_t tid) {

@@ -35,7 +35,7 @@ enum HtStatus : uint8_t {
 
 struct MicaServerTableConfig {
     static constexpr size_t kBucketCap    = 7;
-    static constexpr bool   kConcurrent   = false;
+    static constexpr bool   kConcurrent   = true;
     static constexpr bool   kVerbose      = false;
     static constexpr bool   kCollectStats = true;
     static constexpr size_t kKeySize      = 8;  // uint64_t key
