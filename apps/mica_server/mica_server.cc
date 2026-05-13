@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -18,7 +19,7 @@
 
 DEFINE_uint64(num_server_threads, 1,    "Server threads");
 DEFINE_uint64(num_client_threads, 1,    "Client threads per process");
-DEFINE_uint64(num_keys,        1048576, "Keys pre-loaded in table; must be a power of 2");
+DEFINE_uint64(num_keys,        1048576, "Keys pre-loaded in table");
 DEFINE_string(workload,            "B", "YCSB workload: A (50/50) B (95/5) C (100/0)");
 DEFINE_double(zipf_theta,         0.99, "Zipf skew; 0 = uniform");
 
@@ -26,6 +27,8 @@ DEFINE_double(zipf_theta,         0.99, "Zipf skew; 0 = uniform");
 
 static constexpr bool   kAppMeasureLatency = true;
 static constexpr double kAppLatFac         = 3.0;
+static constexpr const char *kMicaServerConfigPath =
+    "apps/mica_server/mica_server.json";
 
 // ---- Globals ----
 
@@ -77,6 +80,53 @@ static zipf_params g_zipf;
 
 static constexpr size_t kMaxBatch = 16;
 static constexpr size_t kEvLoopMs = 1000;
+
+struct MicaTableConfigSummary {
+    std::string name;
+    uint64_t    item_count;
+    bool        concurrent_read;
+    bool        concurrent_write;
+};
+
+static mica::util::Config load_table_config() {
+    return mica::util::Config::load_file(kMicaServerConfigPath).get("table");
+}
+
+static MicaTableConfigSummary summarize_table_config(
+    const mica::util::Config &table_cfg) {
+    MicaTableConfigSummary summary;
+    summary.name             = table_cfg.get("name").get_str();
+    summary.item_count       = table_cfg.get("item_count").get_uint64();
+    summary.concurrent_read  = table_cfg.get("concurrent_read").get_bool();
+    summary.concurrent_write = table_cfg.get("concurrent_write").get_bool();
+    return summary;
+}
+
+static void verify_and_log_table_config() {
+    const mica::util::Config table_cfg = load_table_config();
+    const MicaTableConfigSummary summary = summarize_table_config(table_cfg);
+
+    fprintf(stderr,
+            "MICA config verification: path=%s table=%s item_count=%llu "
+            "concurrent_read=%s concurrent_write=%s requested_num_keys=%llu "
+            "server_threads=%llu\n",
+            kMicaServerConfigPath, summary.name.c_str(),
+            static_cast<unsigned long long>(summary.item_count),
+            summary.concurrent_read ? "true" : "false",
+            summary.concurrent_write ? "true" : "false",
+            static_cast<unsigned long long>(FLAGS_num_keys),
+            static_cast<unsigned long long>(FLAGS_num_server_threads));
+
+    erpc::rt_assert(
+        summary.item_count >= FLAGS_num_keys,
+        "MICA table item_count (" + std::to_string(summary.item_count) +
+            ") is smaller than --num_keys (" + std::to_string(FLAGS_num_keys) +
+            ")");
+    erpc::rt_assert(summary.concurrent_read,
+                    "MICA table concurrent_read must be true for this run");
+    erpc::rt_assert(summary.concurrent_write,
+                    "MICA table concurrent_write must be true for this run");
+}
 
 class ServerContext : public BasicAppContext {
 public:
@@ -190,8 +240,8 @@ static void server_func(erpc::Nexus *nexus, size_t tid) {
     c.thread_id = tid;
 
     c.alloc = new erpc::HugeAlloc(MB(512), FLAGS_numa_node, nullptr, nullptr);
-    auto cfg = mica::util::Config::load_file("apps/mica_server/mica_server.json");
-    c.table  = new MicaTable(cfg.get("table"), kValSize, c.alloc);
+    auto cfg = load_table_config();
+    c.table  = new MicaTable(cfg, kValSize, c.alloc);
 
     populate_table(c);
 
@@ -243,7 +293,6 @@ public:
     size_t   thread_id;
     uint8_t  ycsb_workload;
     bool     use_zipf;
-    uint64_t key_mask;
     uint64_t rng_state;
     bool     draining = false;  // set true to stop reissuing and let slots drain
 
@@ -266,10 +315,15 @@ static inline uint64_t xorshift64(uint64_t &state) {
     return state;
 }
 
+static inline uint64_t fastrange64(uint64_t rand, uint64_t n) {
+    return static_cast<uint64_t>(
+        static_cast<__uint128_t>(rand) * static_cast<__uint128_t>(n) >> 64);
+}
+
 static inline uint64_t next_key(ClientContext &c) {
     uint64_t r = xorshift64(c.rng_state);
     if (c.use_zipf) return zipf_sample(&g_zipf, r);
-    return (r & c.key_mask) + 1;  // keys are 1-based in the table
+    return fastrange64(r, FLAGS_num_keys) + 1;  // keys are 1-based in the table
 }
 
 static inline bool next_is_set(ClientContext &c) {
@@ -367,11 +421,9 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
     c.thread_id     = tid;
     c.rng_state     = 0xdeadbeef ^ (tid * 1000003ULL);
     c.use_zipf      = FLAGS_zipf_theta > 0.0;
-    c.key_mask      = FLAGS_num_keys - 1;
     c.ycsb_workload = workload_from_flag();
 
-    erpc::rt_assert((FLAGS_num_keys & (FLAGS_num_keys - 1)) == 0,
-                    "--num_keys must be a power of 2 for uniform key distribution");
+    erpc::rt_assert(FLAGS_num_keys > 0, "--num_keys must be positive");
 
     std::vector<size_t> ports = flags_get_numa_ports(FLAGS_numa_node);
     erpc::Rpc<erpc::CTransport> rpc(nexus, &c, tid, basic_sm_handler,
@@ -421,6 +473,8 @@ int main(int argc, char **argv) {
     signal(SIGTERM, ctrl_c_handler);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     fprintf(stderr, "[debug] flags parsed, process_id=%zu\n", FLAGS_process_id);
+
+    if (FLAGS_process_id == 0) verify_and_log_table_config();
 
     std::string uri = erpc::get_uri_for_process(FLAGS_process_id);
     fprintf(stderr, "[debug] uri=%s\n", uri.c_str());
