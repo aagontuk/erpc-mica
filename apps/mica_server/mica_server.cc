@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -128,11 +129,15 @@ static void verify_and_log_table_config() {
                     "MICA table concurrent_write must be true for this run");
 }
 
+struct SharedServerState {
+    std::unique_ptr<erpc::HugeAlloc> alloc;
+    std::unique_ptr<MicaTable>       table;
+};
+
 class ServerContext : public BasicAppContext {
 public:
     size_t           thread_id;
     MicaTable       *table = nullptr;
-    erpc::HugeAlloc *alloc = nullptr;
 
     size_t           batch_sz = 0;
     uint64_t         batch_first_tsc = 0;
@@ -219,31 +224,34 @@ static void ht_set_handler(erpc::ReqHandle *req_handle, void *_ctx) {
     if (c->batch_sz == kMaxBatch) drain_batch(c);
 }
 
-static void populate_table(ServerContext &c) {
+static void populate_table(MicaTable &table) {
     const size_t N = static_cast<size_t>(FLAGS_num_keys);
     size_t i;
     for (i = 1; i <= N; i++) {
         MicaKey  mk = make_key(i);
         uint64_t kh = mica::util::hash(&mk, sizeof(MicaKey));
         uint64_t v  = i + 1;
-        MicaResult res = c.table->set(kh, mk, reinterpret_cast<const char *>(&v));
+        MicaResult res = table.set(kh, mk, reinterpret_cast<const char *>(&v));
         if (res != MicaResult::kSuccess) {
-            printf("thread %zu: populate stopped at key %zu (table full)\n", c.thread_id, i);
+            printf("MICA shared table: populate stopped at key %zu (table full)\n", i);
             break;
         }
     }
-    printf("thread %zu: populated %zu / %zu keys\n", c.thread_id, i - 1, N);
+    printf("MICA shared table: populated %zu / %zu keys\n", i - 1, N);
+    erpc::rt_assert(i - 1 == N,
+                    "MICA shared table preload did not populate all requested keys");
 }
 
-static void server_func(erpc::Nexus *nexus, size_t tid) {
+static void server_func(erpc::Nexus *nexus, size_t tid,
+                        SharedServerState *shared_state) {
     ServerContext c;
     c.thread_id = tid;
 
-    c.alloc = new erpc::HugeAlloc(MB(512), FLAGS_numa_node, nullptr, nullptr);
-    auto cfg = load_table_config();
-    c.table  = new MicaTable(cfg, kValSize, c.alloc);
-
-    populate_table(c);
+    erpc::rt_assert(shared_state != nullptr, "server shared state is null");
+    erpc::rt_assert(shared_state->table != nullptr, "server shared table is null");
+    c.table = shared_state->table.get();
+    printf("Server thread %zu using shared table %p\n",
+           tid, static_cast<void *>(c.table));
 
     std::vector<size_t> ports = flags_get_numa_ports(FLAGS_numa_node);
     erpc::Rpc<erpc::CTransport> rpc(nexus, &c, tid, basic_sm_handler,
@@ -264,9 +272,6 @@ static void server_func(erpc::Nexus *nexus, size_t tid) {
     printf("Server thread %zu: gets_ok=%zu miss=%zu | sets_ok=%zu fail=%zu\n",
            tid, c.stats.gets_ok, c.stats.gets_miss,
            c.stats.sets_ok, c.stats.sets_fail);
-
-    delete c.table;
-    delete c.alloc;
 }
 
 // ============================================================
@@ -288,6 +293,31 @@ struct PendingSlot {
     erpc::MsgBuffer resp_buf;
 };
 
+struct ClientStats {
+    size_t rx_tot  = 0;
+    size_t gets_ok = 0, gets_miss = 0;
+    size_t sets_ok = 0, sets_fail = 0;
+};
+
+static void add_client_stats(ClientStats &dst, const ClientStats &src) {
+    dst.rx_tot    += src.rx_tot;
+    dst.gets_ok   += src.gets_ok;
+    dst.gets_miss += src.gets_miss;
+    dst.sets_ok   += src.sets_ok;
+    dst.sets_fail += src.sets_fail;
+}
+
+struct ClientThreadSummary {
+    ClientStats   stats;
+    erpc::Latency latency;
+    double        seconds = 0.0;
+    bool          valid = false;
+};
+
+struct ClientAggregateState {
+    std::vector<ClientThreadSummary> thread_summary;
+};
+
 class ClientContext : public BasicAppContext {
 public:
     size_t   thread_id;
@@ -299,13 +329,16 @@ public:
     erpc::Latency    latency;
     erpc::ChronoTimer tput_timer;
 
+    ClientStats      total_stats;
+    erpc::Latency    total_latency;
+    erpc::ChronoTimer total_timer;
+    double           total_seconds = 0.0;
+
+    ClientAggregateState *aggregate_state = nullptr;
+
     std::vector<PendingSlot> pending;  // sized to kPendingPerServerThread * num_server_threads
 
-    struct {
-        size_t rx_tot  = 0;
-        size_t gets_ok = 0, gets_miss = 0;
-        size_t sets_ok = 0, sets_fail = 0;
-    } stats;
+    ClientStats stats;
 };
 
 static inline uint64_t xorshift64(uint64_t &state) {
@@ -361,25 +394,43 @@ void kv_cont_func(void *_ctx, void *_tag) {
     auto   *c        = static_cast<ClientContext *>(_ctx);
     size_t  slot_idx = reinterpret_cast<size_t>(_tag);
     PendingSlot &slot = c->pending[slot_idx];
+    const bool count_sample = !c->draining;
 
     if (kAppMeasureLatency) {
         double lat_us = erpc::to_usec(erpc::rdtsc() - slot.req_tsc,
                                       c->rpc_->get_freq_ghz());
-        c->latency.update(static_cast<size_t>(lat_us * kAppLatFac));
+        if (count_sample) {
+            const size_t scaled_lat_us = static_cast<size_t>(lat_us * kAppLatFac);
+            c->latency.update(scaled_lat_us);
+            c->total_latency.update(scaled_lat_us);
+        }
     }
 
     const auto *resp =
         reinterpret_cast<const ht_rpc_resp_t *>(slot.resp_buf.buf_);
 
-    if (slot.is_set) {
-        if (resp->status == HT_SUCCESS) c->stats.sets_ok++;
-        else                            c->stats.sets_fail++;
-    } else {
-        if (resp->status == HT_SUCCESS) c->stats.gets_ok++;
-        else                            c->stats.gets_miss++;
-    }
+    if (count_sample) {
+        if (slot.is_set) {
+            if (resp->status == HT_SUCCESS) {
+                c->stats.sets_ok++;
+                c->total_stats.sets_ok++;
+            } else {
+                c->stats.sets_fail++;
+                c->total_stats.sets_fail++;
+            }
+        } else {
+            if (resp->status == HT_SUCCESS) {
+                c->stats.gets_ok++;
+                c->total_stats.gets_ok++;
+            } else {
+                c->stats.gets_miss++;
+                c->total_stats.gets_miss++;
+            }
+        }
 
-    c->stats.rx_tot++;
+        c->stats.rx_tot++;
+        c->total_stats.rx_tot++;
+    }
 
     if (!c->draining)
         kv_send_req(*c, slot_idx);  // reissue immediately — same pattern as small_rpc_tput
@@ -416,12 +467,54 @@ static void print_stats(ClientContext &c) {
     c.tput_timer.reset();
 }
 
-static void client_func(erpc::Nexus *nexus, size_t tid) {
+static void print_client_aggregate(const ClientAggregateState &aggregate_state) {
+    ClientStats total_stats;
+    erpc::Latency total_latency;
+    double aggregate_mrps = 0.0;
+    double max_seconds = 0.0;
+    size_t valid_threads = 0;
+
+    for (const ClientThreadSummary &summary : aggregate_state.thread_summary) {
+        if (!summary.valid) continue;
+        valid_threads++;
+        add_client_stats(total_stats, summary.stats);
+        total_latency += summary.latency;
+        if (summary.seconds > 0.0)
+            aggregate_mrps += summary.stats.rx_tot / (summary.seconds * 1e6);
+        max_seconds = std::max(max_seconds, summary.seconds);
+    }
+
+    const double wall_mrps =
+        max_seconds > 0.0 ? total_stats.rx_tot / (max_seconds * 1e6) : 0.0;
+
+    printf("Client aggregate throughput: %.3f Mrps "
+           "(sum of per-thread throughput), %.3f Mrps over %.3f s wall, "
+           "threads=%zu\n",
+           aggregate_mrps, wall_mrps, max_seconds, valid_threads);
+
+    if (kAppMeasureLatency && total_latency.count() > 0) {
+        printf("Client aggregate latency: avg=%.2f us p50=%.2f us "
+               "p99=%.2f us samples=%zu\n",
+               total_latency.avg() / kAppLatFac,
+               total_latency.perc(0.50) / kAppLatFac,
+               total_latency.perc(0.99) / kAppLatFac,
+               total_latency.count());
+    }
+
+    printf("Client aggregate totals: rx=%zu | GET ok=%zu miss=%zu | "
+           "SET ok=%zu fail=%zu\n",
+           total_stats.rx_tot, total_stats.gets_ok, total_stats.gets_miss,
+           total_stats.sets_ok, total_stats.sets_fail);
+}
+
+static void client_func(erpc::Nexus *nexus, size_t tid,
+                        ClientAggregateState *aggregate_state) {
     ClientContext c;
     c.thread_id     = tid;
     c.rng_state     = 0xdeadbeef ^ (tid * 1000003ULL);
     c.use_zipf      = FLAGS_zipf_theta > 0.0;
     c.ycsb_workload = workload_from_flag();
+    c.aggregate_state = aggregate_state;
 
     erpc::rt_assert(FLAGS_num_keys > 0, "--num_keys must be positive");
 
@@ -445,6 +538,7 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
 
     // Fill all slots upfront — same pattern as small_rpc_tput's initial send_reqs loop.
     c.tput_timer.reset();
+    c.total_timer.reset();
     for (size_t i = 0; i < max_pending; i++) kv_send_req(c, i);
 
     for (size_t i = 0; i < FLAGS_test_ms; i += kEvLoopMs) {
@@ -452,6 +546,7 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
         if (ctrl_c_pressed == 1) break;
         print_stats(c);
     }
+    c.total_seconds = c.total_timer.get_sec();
 
     // Stop reissuing and drain all in-flight RPCs so sessions become idle.
     c.draining = true;
@@ -462,6 +557,17 @@ static void client_func(erpc::Nexus *nexus, size_t tid) {
     const size_t expected_sm_resps = 2 * FLAGS_num_server_threads;  // connect + disconnect
     for (size_t ms = 0; ms < 5000 && c.num_sm_resps_ < expected_sm_resps; ms += kEvLoopMs)
         rpc.run_event_loop(kEvLoopMs);
+
+    if (c.aggregate_state != nullptr) {
+        erpc::rt_assert(c.thread_id < c.aggregate_state->thread_summary.size(),
+                        "client aggregate state is too small");
+        ClientThreadSummary &summary =
+            c.aggregate_state->thread_summary[c.thread_id];
+        summary.stats = c.total_stats;
+        summary.latency = c.total_latency;
+        summary.seconds = c.total_seconds;
+        summary.valid = true;
+    }
 }
 
 // ============================================================
@@ -487,16 +593,43 @@ int main(int argc, char **argv) {
     size_t nthreads = (FLAGS_process_id == 0) ? FLAGS_num_server_threads
                                               : FLAGS_num_client_threads;
 
+    std::unique_ptr<SharedServerState> shared_server_state;
+    if (FLAGS_process_id == 0) {
+        fprintf(stderr, "MICA shared table: constructing once for %llu server threads\n",
+                static_cast<unsigned long long>(FLAGS_num_server_threads));
+        shared_server_state.reset(new SharedServerState());
+        shared_server_state->alloc.reset(
+            new erpc::HugeAlloc(MB(512), FLAGS_numa_node, nullptr, nullptr));
+        auto cfg = load_table_config();
+        shared_server_state->table.reset(
+            new MicaTable(cfg, kValSize, shared_server_state->alloc.get()));
+        populate_table(*shared_server_state->table);
+    }
+
+    std::unique_ptr<ClientAggregateState> client_aggregate_state;
+    if (FLAGS_process_id != 0) {
+        client_aggregate_state.reset(new ClientAggregateState());
+        client_aggregate_state->thread_summary.resize(FLAGS_num_client_threads);
+    }
+
     if (FLAGS_process_id != 0 && FLAGS_zipf_theta > 0.0)
         zipf_init(&g_zipf, FLAGS_num_keys, FLAGS_zipf_theta);
 
     std::vector<std::thread> threads(nthreads);
     for (size_t i = 0; i < nthreads; i++) {
-        threads[i] = std::thread(
-            (FLAGS_process_id == 0) ? server_func : client_func, &nexus, i);
+        if (FLAGS_process_id == 0) {
+            threads[i] = std::thread(server_func, &nexus, i,
+                                     shared_server_state.get());
+        } else {
+            threads[i] = std::thread(client_func, &nexus, i,
+                                     client_aggregate_state.get());
+        }
         erpc::bind_to_core(threads[i], FLAGS_numa_node, i);
     }
     for (auto &t : threads) t.join();
+
+    if (FLAGS_process_id != 0)
+        print_client_aggregate(*client_aggregate_state);
 
     return 0;
 }
