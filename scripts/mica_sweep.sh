@@ -16,8 +16,7 @@
 # Options:
 #   --num-server-threads N   Server RPC threads (default: 1; grid: max threads to sweep)
 #   --max-client-threads N   Sweep client threads 1..N (default: 16)
-#   --num-keys N             Key space size; rounded up to next power of 2
-#                            (default: 1048576)
+#   --num-keys N             Key space size (default: 64000000)
 #   --ycsb a|b|c             YCSB workload mix (single-config mode only):
 #                              a = 50% GET / 50% SET
 #                              b = 95% GET /  5% SET  (default)
@@ -29,11 +28,13 @@
 #                            ycsb, and skew; save peak results to CSV
 #   --csv-out FILE           CSV output file for grid mode
 #                            (default: mica_results_<timestamp>.csv)
+#   --hugepages N            2MB hugepages to allocate on NUMA_NODE before
+#                            starting (default: 3072 = 6 GB)
 #
 # Fixed parameters (edit variables below to change):
 #   CLIENT_NODE   SSH target for client process  (default: node-1)
 #   NUMA_NODE     NUMA node for both sides       (default: 1)
-#   NUMA_PORTS    NIC port IDs on that node      (default: 3)
+#   NUMA_PORTS    NIC port IDs on that node      (default: 2)
 
 set -euo pipefail
 
@@ -45,17 +46,18 @@ BINARY="$REPO_ROOT/build/mica_server"
 # ---- Fixed parameters (edit here) ------------------------------------------
 CLIENT_NODE="node-1"
 NUMA_NODE=1
-NUMA_PORTS=3
+NUMA_PORTS=2
 
 # ---- Defaults for user options ----------------------------------------------
-NUM_SERVER_THREADS=1
+NUM_SERVER_THREADS=8
 MAX_CLIENT_THREADS=16
 NUM_KEYS=1048576
 YCSB="b"
 SKEW="zipf"
-TEST_MS=5000
+TEST_MS=10000
 GRID=0
 CSV_OUT=""
+HUGEPAGES=4096
 
 # ---- Argument parsing -------------------------------------------------------
 usage() {
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --test-ms)            TEST_MS="$2";            shift 2 ;;
         --grid)               GRID=1;                  shift ;;
         --csv-out)            CSV_OUT="$2";            shift 2 ;;
+        --hugepages)          HUGEPAGES="$2";          shift 2 ;;
         -h|--help)   usage ;;
         *) echo "Unknown option: $1" >&2; usage ;;
     esac
@@ -86,18 +89,6 @@ done
 if [[ "$GRID" == "1" && -z "$CSV_OUT" ]]; then
     CSV_OUT="mica_results_$(date +%Y%m%d_%H%M%S).csv"
 fi
-
-# ---- Round up to next power of 2 --------------------------------------------
-next_pow2() {
-    local n=$1 p=1
-    while (( p < n )); do p=$(( p * 2 )); done
-    echo $p
-}
-
-ORIG_KEYS=$NUM_KEYS
-NUM_KEYS=$(next_pow2 "$NUM_KEYS")
-(( NUM_KEYS == ORIG_KEYS )) || \
-    echo "Note: --num-keys $ORIG_KEYS rounded up to $NUM_KEYS (next power of 2)"
 
 # ---- Derive binary flags (single-config mode) --------------------------------
 WORKLOAD="${YCSB^^}"
@@ -203,16 +194,46 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# ---- Hugepage setup ---------------------------------------------------------
+echo "Allocating $HUGEPAGES x 2MB hugepages on NUMA node $NUMA_NODE..."
+sudo sh -c "echo $HUGEPAGES > /sys/devices/system/node/node${NUMA_NODE}/hugepages/hugepages-2048kB/nr_hugepages"
+actual=$(cat /sys/devices/system/node/node${NUMA_NODE}/hugepages/hugepages-2048kB/nr_hugepages)
+(( actual >= HUGEPAGES )) || { echo "Error: only $actual hugepages allocated (need $HUGEPAGES)" >&2; exit 1; }
+
 echo "Cleaning up stale processes..."
 cleanup
 sleep 1
 
 # ---- Run one client point ---------------------------------------------------
-# Outputs: AGG_MRPS, AVG_P50, AVG_P99  (sets variables in caller's scope)
+# Outputs: AGG_MRPS, WALL_MRPS, AVG_LAT, AVG_P50, AVG_P99, LAT_SAMPLES,
+#          TOTAL_RX, TOTAL_GET_OK, TOTAL_GET_MISS, TOTAL_SET_OK, TOTAL_SET_FAIL
+#          (sets variables in caller's scope)
 # Uses: WORKLOAD, ZIPF_THETA, NUM_SERVER_THREADS, NUM_KEYS, TEST_MS (globals)
+extract_field() {
+    local line=$1 pattern=$2 default=${3:-0} out
+    out=$(grep -oP "$pattern" <<< "$line" | head -n 1 || true)
+    echo "${out:-$default}"
+}
+
+reset_point_results() {
+    AGG_MRPS=0
+    WALL_MRPS=0
+    AVG_LAT=0
+    AVG_P50=0
+    AVG_P99=0
+    LAT_SAMPLES=0
+    TOTAL_RX=0
+    TOTAL_GET_OK=0
+    TOTAL_GET_MISS=0
+    TOTAL_SET_OK=0
+    TOTAL_SET_FAIL=0
+}
+
 run_point() {
     local nthreads=$1
     local raw
+
+    reset_point_results
 
     raw=$(ssh "$CLIENT_NODE" \
         "cd '$REPO_ROOT' && sudo '$BINARY' \
@@ -225,11 +246,37 @@ run_point() {
             --numa_node $NUMA_NODE --numa_1_ports $NUMA_PORTS \
             2>/dev/null") || true
 
+    local agg_line lat_line totals_line
+    agg_line=$(printf "%s\n" "$raw" | grep "^Client aggregate throughput:" | tail -n 1 || true)
+    lat_line=$(printf "%s\n" "$raw" | grep "^Client aggregate latency:" | tail -n 1 || true)
+    totals_line=$(printf "%s\n" "$raw" | grep "^Client aggregate totals:" | tail -n 1 || true)
+
+    if [[ -n "$agg_line" ]]; then
+        AGG_MRPS=$(extract_field "$agg_line" '^Client aggregate throughput: \K[\d.]+')
+        WALL_MRPS=$(extract_field "$agg_line" ', \K[\d.]+(?= Mrps over)')
+
+        if [[ -n "$lat_line" ]]; then
+            AVG_LAT=$(extract_field "$lat_line" 'avg=\K[\d.]+')
+            AVG_P50=$(extract_field "$lat_line" 'p50=\K[\d.]+')
+            AVG_P99=$(extract_field "$lat_line" 'p99=\K[\d.]+')
+            LAT_SAMPLES=$(extract_field "$lat_line" 'samples=\K[0-9]+')
+        fi
+
+        if [[ -n "$totals_line" ]]; then
+            TOTAL_RX=$(extract_field "$totals_line" 'rx=\K[0-9]+')
+            TOTAL_GET_OK=$(extract_field "$totals_line" 'GET ok=\K[0-9]+')
+            TOTAL_GET_MISS=$(extract_field "$totals_line" 'GET ok=[0-9]+ miss=\K[0-9]+')
+            TOTAL_SET_OK=$(extract_field "$totals_line" 'SET ok=\K[0-9]+')
+            TOTAL_SET_FAIL=$(extract_field "$totals_line" 'SET ok=[0-9]+ fail=\K[0-9]+')
+        fi
+
+        return 0
+    fi
+
     local stat_lines
-    stat_lines=$(echo "$raw" | grep "^Thread " | tail -n "$nthreads")
+    stat_lines=$(printf "%s\n" "$raw" | grep "^Thread " | tail -n "$nthreads")
 
     if [[ -z "$stat_lines" ]]; then
-        AGG_MRPS="0"; AVG_P50="0"; AVG_P99="0"
         return 1
     fi
 
@@ -246,6 +293,7 @@ run_point() {
     done <<< "$stat_lines"
 
     AGG_MRPS="$sum_mrps"
+    WALL_MRPS="$sum_mrps"
     AVG_P50=$(awk "BEGIN{printf \"%.2f\", $sum_p50 / $n}")
     AVG_P99=$(awk "BEGIN{printf \"%.2f\", $sum_p99 / $n}")
 }
@@ -260,8 +308,9 @@ if [[ "$GRID" == "1" ]]; then
     echo "Output CSV: ${CSV_OUT}"
     echo ""
 
-    # Write CSV header
-    echo "threads,ycsb,skew,throughput_mrps,p50_us,p99_us" > "$CSV_OUT"
+    # Write CSV header. Each row is the peak client-thread point for one
+    # server-thread/workload/skew configuration.
+    echo "server_threads,ycsb,skew,peak_client_threads,throughput_mrps_sum,throughput_mrps_wall,avg_us,p50_us,p99_us,latency_samples,total_rx,get_ok,get_miss,set_ok,set_fail" > "$CSV_OUT"
 
     for (( sthreads=1; sthreads<=NUM_SERVER_THREADS; sthreads++ )); do
         NUM_SERVER_THREADS_SAVED=$NUM_SERVER_THREADS
@@ -274,8 +323,12 @@ if [[ "$GRID" == "1" ]]; then
 
                 echo "  [threads=$sthreads ycsb=$ycsb_iter skew=$skew_iter] sweeping 1..${MAX_CLIENT_THREADS} client threads..."
 
-                PEAK_MRPS=0; PEAK_P50=0; PEAK_P99=0
-                AGG_MRPS=0; AVG_P50=0; AVG_P99=0
+                PEAK_THREADS=0
+                PEAK_MRPS=0; PEAK_WALL_MRPS=0
+                PEAK_AVG_LAT=0; PEAK_P50=0; PEAK_P99=0; PEAK_LAT_SAMPLES=0
+                PEAK_TOTAL_RX=0; PEAK_GET_OK=0; PEAK_GET_MISS=0
+                PEAK_SET_OK=0; PEAK_SET_FAIL=0
+                reset_point_results
 
                 # Start the server once for this (sthreads, ycsb, skew) combo.
                 # The client properly disconnects sessions after each run, so
@@ -293,12 +346,21 @@ if [[ "$GRID" == "1" ]]; then
                     fi
                     if run_point "$t"; then
                         if awk "BEGIN{exit !($AGG_MRPS > $PEAK_MRPS)}"; then
+                            PEAK_THREADS="$t"
                             PEAK_MRPS="$AGG_MRPS"
+                            PEAK_WALL_MRPS="$WALL_MRPS"
+                            PEAK_AVG_LAT="$AVG_LAT"
                             PEAK_P50="$AVG_P50"
                             PEAK_P99="$AVG_P99"
+                            PEAK_LAT_SAMPLES="$LAT_SAMPLES"
+                            PEAK_TOTAL_RX="$TOTAL_RX"
+                            PEAK_GET_OK="$TOTAL_GET_OK"
+                            PEAK_GET_MISS="$TOTAL_GET_MISS"
+                            PEAK_SET_OK="$TOTAL_SET_OK"
+                            PEAK_SET_FAIL="$TOTAL_SET_FAIL"
                         fi
-                        printf "    client_threads=%-3d  %.3f Mrps  p50=%s µs  p99=%s µs\n" \
-                            "$t" "$AGG_MRPS" "$AVG_P50" "$AVG_P99"
+                        printf "    client_threads=%-3d  %.3f Mrps  p50=%s us  p99=%s us  rx=%s\n" \
+                            "$t" "$AGG_MRPS" "$AVG_P50" "$AVG_P99" "$TOTAL_RX"
                     else
                         printf "    client_threads=%-3d  FAILED\n" "$t"
                     fi
@@ -306,8 +368,8 @@ if [[ "$GRID" == "1" ]]; then
 
                 stop_server
 
-                echo "  → peak: ${PEAK_MRPS} Mrps  p50=${PEAK_P50} µs  p99=${PEAK_P99} µs"
-                echo "${sthreads},${ycsb_iter},${skew_iter},${PEAK_MRPS},${PEAK_P50},${PEAK_P99}" >> "$CSV_OUT"
+                echo "  -> peak: ${PEAK_MRPS} Mrps at ${PEAK_THREADS} client threads  p50=${PEAK_P50} us  p99=${PEAK_P99} us"
+                echo "${sthreads},${ycsb_iter},${skew_iter},${PEAK_THREADS},${PEAK_MRPS},${PEAK_WALL_MRPS},${PEAK_AVG_LAT},${PEAK_P50},${PEAK_P99},${PEAK_LAT_SAMPLES},${PEAK_TOTAL_RX},${PEAK_GET_OK},${PEAK_GET_MISS},${PEAK_SET_OK},${PEAK_SET_FAIL}" >> "$CSV_OUT"
             done
         done
 
