@@ -46,9 +46,9 @@ BINARY="$REPO_ROOT/build/mica_server"
 
 # ---- Fixed parameters (edit here) ------------------------------------------
 CLIENT_NODE="node1"
-NUMA_NODE=0
-SERVER_NUMA_PORTS=0
-CLIENT_NUMA_PORTS=1
+NUMA_NODE=1
+SERVER_NUMA_PORTS=2
+CLIENT_NUMA_PORTS=3
 
 # ---- Defaults for user options ----------------------------------------------
 NUM_SERVER_THREADS=8
