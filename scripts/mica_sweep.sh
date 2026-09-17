@@ -32,9 +32,10 @@
 #                            starting (default: 3072 = 6 GB)
 #
 # Fixed parameters (edit variables below to change):
-#   CLIENT_NODE   SSH target for client process  (default: node-1)
-#   NUMA_NODE     NUMA node for both sides       (default: 1)
-#   NUMA_PORTS    NIC port IDs on that node      (default: 2)
+#   CLIENT_NODE         SSH target for client process   (default: node-1)
+#   NUMA_NODE           NUMA node for both sides         (default: 1)
+#   SERVER_NUMA_PORTS   NIC port ID(s) on the server     (default: 2)
+#   CLIENT_NUMA_PORTS   NIC port ID(s) on the client     (default: 2)
 
 set -euo pipefail
 
@@ -44,9 +45,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$REPO_ROOT/build/mica_server"
 
 # ---- Fixed parameters (edit here) ------------------------------------------
-CLIENT_NODE="node-1"
-NUMA_NODE=1
-NUMA_PORTS=2
+CLIENT_NODE="node1"
+NUMA_NODE=0
+SERVER_NUMA_PORTS=0
+CLIENT_NUMA_PORTS=1
 
 # ---- Defaults for user options ----------------------------------------------
 NUM_SERVER_THREADS=8
@@ -108,7 +110,7 @@ start_server() {
         --process_id 0 --num_processes 2 \
         --num_server_threads "$nthreads" --num_client_threads 0 \
         --num_keys "$NUM_KEYS" \
-        --numa_node "$NUMA_NODE" --numa_1_ports "$NUMA_PORTS" \
+        --numa_node "$NUMA_NODE" "--numa_${NUMA_NODE}_ports" "$SERVER_NUMA_PORTS" \
         > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
@@ -195,10 +197,16 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---- Hugepage setup ---------------------------------------------------------
-echo "Allocating $HUGEPAGES x 2MB hugepages on NUMA node $NUMA_NODE..."
+echo "Allocating $HUGEPAGES x 2MB hugepages on NUMA node $NUMA_NODE (server: local)..."
 sudo sh -c "echo $HUGEPAGES > /sys/devices/system/node/node${NUMA_NODE}/hugepages/hugepages-2048kB/nr_hugepages"
 actual=$(cat /sys/devices/system/node/node${NUMA_NODE}/hugepages/hugepages-2048kB/nr_hugepages)
 (( actual >= HUGEPAGES )) || { echo "Error: only $actual hugepages allocated (need $HUGEPAGES)" >&2; exit 1; }
+
+echo "Allocating $HUGEPAGES x 2MB hugepages on NUMA node $NUMA_NODE (client: $CLIENT_NODE)..."
+client_actual=$(ssh "$CLIENT_NODE" \
+    "sudo sh -c 'echo $HUGEPAGES > /sys/devices/system/node/node${NUMA_NODE}/hugepages/hugepages-2048kB/nr_hugepages'; \
+     cat /sys/devices/system/node/node${NUMA_NODE}/hugepages/hugepages-2048kB/nr_hugepages")
+(( client_actual >= HUGEPAGES )) || { echo "Error: only $client_actual hugepages allocated on $CLIENT_NODE (need $HUGEPAGES)" >&2; exit 1; }
 
 echo "Cleaning up stale processes..."
 cleanup
@@ -243,7 +251,7 @@ run_point() {
             --num_keys $NUM_KEYS \
             --test_ms $TEST_MS \
             --workload $WORKLOAD --zipf_theta $ZIPF_THETA \
-            --numa_node $NUMA_NODE --numa_1_ports $NUMA_PORTS \
+            --numa_node $NUMA_NODE --numa_${NUMA_NODE}_ports $CLIENT_NUMA_PORTS \
             2>/dev/null") || true
 
     local agg_line lat_line totals_line
