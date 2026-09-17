@@ -6,6 +6,16 @@
 #include <numaif.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+
+// glibc's <sys/shm.h> doesn't always declare this (e.g., on hosts where the
+// installed headers predate it), so define the kernel ABI constant directly
+// if needed. Without it, shmget() falls back to the kernel's default huge
+// page size (which may not be 2 MB, e.g., if booted with
+// default_hugepagesz=1G), causing the mbind() below to fail with EINVAL
+// because size/addr are only aligned to kHugepageSize (2 MB).
+#ifndef SHM_HUGE_2MB
+#define SHM_HUGE_2MB (21 << 26)
+#endif
 #endif
 
 namespace erpc {
@@ -84,7 +94,8 @@ Buffer HugeAlloc::alloc_raw(size_t size, DoRegister do_register) {
     shm_key = std::abs(shm_key);
 
     // Try to get an SHM region
-    shm_id = shmget(shm_key, size, IPC_CREAT | IPC_EXCL | 0666 | SHM_HUGETLB);
+    shm_id = shmget(shm_key, size,
+                    IPC_CREAT | IPC_EXCL | 0666 | SHM_HUGETLB | SHM_HUGE_2MB);
 
     if (shm_id == -1) {
       switch (errno) {
